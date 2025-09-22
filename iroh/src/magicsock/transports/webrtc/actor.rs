@@ -197,18 +197,39 @@ pub struct PeerConnectionState {
     #[cfg(not(wasm_browser))]
     peer_connection: Arc<RTCPeerConnection>,
     #[cfg(not(wasm_browser))]
-    data_channel: Option<Arc<RTCDataChannel>>,
+    data_channel: Arc<RTCDataChannel>,
 
     #[cfg(wasm_browser)]
     peer_connection: RtcPeerConnection,
     #[cfg(wasm_browser)]
-    data_channel: Option<web_sys::RtcDataChannel>,
+    data_channel: web_sys::RtcDataChannel,
 
     connection_state: ConnectionState,
     is_initiator: bool,
     peer_node: NodeId,
     send_recv_datagram: mpsc::Sender<WebRtcRecvDatagrams>,
     send_ice_candidate_to_msock_tx: mpsc::Sender<ActorMessage>,
+}
+
+// Config for an unordered, unreliable, manually negotiated datachannel using SCTP stream id 0
+// Manually negotiated datachannels do not result in an on_datachannel event, so keep that in mind.
+#[cfg(not(wasm_browser))]
+fn dc_init() -> webrtc::data_channel::data_channel_init::RTCDataChannelInit {
+    webrtc::data_channel::data_channel_init::RTCDataChannelInit {
+        negotiated: Some(0),
+        max_retransmits: Some(0),
+        ordered: Some(false),
+        ..Default::default()
+    }
+}
+#[cfg(wasm_browser)]
+fn dc_init() -> web_sys::RtcDataChannelInit {
+    let mut ret = web_sys::RtcDataChannelInit::new();
+    ret.set_id(0);
+    ret.set_max_retransmits(0);
+    ret.set_negotiated(true);
+    ret.set_ordered(false);
+    ret
 }
 
 impl PeerConnectionState {
@@ -230,9 +251,14 @@ impl PeerConnectionState {
                 .map_err(|_| WebRtcError::PeerConnectionCreationFailed)?,
         );
 
+        // Create our manually negotiated datachannel
+        let data_channel = peer_connection.create_data_channel("data", Some(dc_init()))
+            .await
+            .map_err(|_| WebRtcError::DataChannelCreationFailed)?;
+
         let mut state = Self {
             peer_connection: peer_connection.clone(),
-            data_channel: None,
+            data_channel,
             connection_state: ConnectionState::New,
             is_initiator,
             peer_node,
@@ -358,9 +384,12 @@ impl PeerConnectionState {
         let peer_connection = RtcPeerConnection::new_with_configuration(&config)
             .map_err(|_| WebRtcError::PeerConnectionCreationFailed)?;
 
+        // Create our manually negotiated data channel
+        let data_channel = self.peer_connection.create_data_channel_with_data_channel_dict("data", &dc_init());
+
         Ok(Self {
             peer_connection,
-            data_channel: None,
+            data_channel,
             connection_state: ConnectionState::New,
             is_initiator,
             peer_node,
@@ -370,13 +399,6 @@ impl PeerConnectionState {
 
     #[cfg(not(wasm_browser))]
     pub async fn create_offer(&mut self) -> Result<String, WebRtcError> {
-        let data_channel = self
-            .peer_connection
-            .create_data_channel("data", None)
-            .await
-            .map_err(|_| WebRtcError::DataChannelCreationFailed)?;
-
-        self.data_channel = Some(data_channel);
         self.setup_data_channel_handler().await?;
 
         let offer = self
@@ -397,9 +419,6 @@ impl PeerConnectionState {
     #[cfg(wasm_browser)]
     pub async fn create_offer(&mut self) -> Result<String, WebRtcError> {
         use wasm_bindgen_futures::JsFuture;
-
-        let data_channel = self.peer_connection.create_data_channel("data");
-        self.data_channel = Some(data_channel);
 
         let offer_promise = self.peer_connection.create_offer();
         let offer = JsFuture::from(offer_promise)
@@ -526,11 +545,6 @@ impl PeerConnectionState {
     async fn setup_data_channel_handler(&mut self) -> Result<(), WebRtcError> {
         let data_channel = self
             .data_channel
-            .as_ref()
-            .ok_or_else(|| {
-                println!("❌ No data channel found for peer {}", self.peer_node);
-                WebRtcError::NoDataChannel
-            })?
             .clone();
 
         let dc = Arc::new(data_channel);
@@ -632,6 +646,8 @@ impl PeerConnectionState {
 
     #[cfg(not(wasm_browser))]
     pub async fn create_answer(&mut self, offer_sdp: WebRtcOffer) -> Result<String, WebRtcError> {
+        self.setup_data_channel_handler().await?;
+
         // First set the remote description
         let offer_sdp = offer_sdp.offer;
         let remote_desc = RTCSessionDescription::offer(offer_sdp)
@@ -659,6 +675,7 @@ impl PeerConnectionState {
 
     #[cfg(wasm_browser)]
     pub async fn create_answer(&mut self) -> Result<String, WebRtcError> {
+        // TODO: Setup datachannel handler
         let answer_promise = self.peer_connection.create_answer();
         let answer = JsFuture::from(answer_promise)
             .await
@@ -678,10 +695,8 @@ impl PeerConnectionState {
     pub async fn send_data(&self, data: &WebRtcData) -> Result<(), WebRtcError> {
         #[cfg(not(wasm_browser))]
         {
-            let channel = self
-                .data_channel
-                .as_ref()
-                .ok_or(WebRtcError::NoDataChannel)?;
+            let channel = &self
+                .data_channel;
             channel
                 .send(&data.payload)
                 .await
@@ -690,10 +705,8 @@ impl PeerConnectionState {
 
         #[cfg(wasm_browser)]
         {
-            let channel = self
-                .data_channel
-                .as_ref()
-                .ok_or(WebRtcError::NoDataChannel)?;
+            let channel = &self
+                .data_channel;
             channel
                 .send_with_u8_array(&data.payload)
                 .map_err(|_| WebRtcError::SendFailed)?;
